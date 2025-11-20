@@ -19,12 +19,12 @@ def lower_controller(
     assert(desired.shape == (2,))
     
     # PID gains for steering rate control
-    Kp_steer = 2.5
-    Ki_steer = 0.05
-    Kd_steer = 0.7
+    Kp_steer = 2.6
+    Ki_steer = 0.07
+    Kd_steer = 0.4
     
     # PID gains for velocity/acceleration control
-    Kp_vel = 4
+    Kp_vel = 5
     Ki_vel = 0.02
     Kd_vel = 0.3
     
@@ -38,11 +38,9 @@ def lower_controller(
     
     # Steering PID control
     steer_error = desired_steer - current_steer
-    # Normalize steering error to [-pi, pi] range
     steer_error = np.arctan2(np.sin(steer_error), np.cos(steer_error))
     
     _controller_state['steering_integral'] += steer_error
-    # Anti-windup: limit integral term
     _controller_state['steering_integral'] = np.clip(_controller_state['steering_integral'], -2.0, 2.0)
     
     steer_derivative = steer_error - _controller_state['steering_prev_error']
@@ -52,7 +50,6 @@ def lower_controller(
     # Velocity PID control
     vel_error = desired_vel - current_vel
     _controller_state['velocity_integral'] += vel_error
-    # Anti-windup: limit integral term
     _controller_state['velocity_integral'] = np.clip(_controller_state['velocity_integral'], -50.0, 50.0)
     
     vel_derivative = vel_error - _controller_state['velocity_prev_error']
@@ -72,163 +69,98 @@ def controller(
     Pure Pursuit + Stanley hybrid controller for bicycle model path following.
     State: [x, y, steering_angle, velocity, heading]
     """
-    # Extract state variables
     car_pos = state[0:2]
     car_heading = state[4]
     current_vel = state[3]
-    wheelbase = parameters[0]  # L in bicycle model
+    wheelbase = parameters[0]
+    num_points = len(racetrack.centerline)
     
-    # Find closest point on centerline (start search near last position for efficiency)
-    start_idx = max(0, _controller_state['last_closest_idx'] - 10)
-    end_idx = min(len(racetrack.centerline), _controller_state['last_closest_idx'] + 50)
-    
-    search_range = racetrack.centerline[start_idx:end_idx]
-    if len(search_range) == 0:
-        search_range = racetrack.centerline
+    # Find closest point (looped)
+    start_idx = (_controller_state['last_closest_idx'] - 10) % num_points
+    end_idx = (_controller_state['last_closest_idx'] + 50) % num_points
+    if start_idx < end_idx:
+        search_range = racetrack.centerline[start_idx:end_idx]
+        search_indices = np.arange(start_idx, end_idx)
+    else:
+        search_range = np.vstack((racetrack.centerline[start_idx:], racetrack.centerline[:end_idx]))
+        search_indices = np.concatenate((np.arange(start_idx, num_points), np.arange(0, end_idx)))
     
     distances = np.linalg.norm(search_range - car_pos, axis=1)
     local_closest_idx = np.argmin(distances)
-    closest_idx = start_idx + local_closest_idx
-    
-    # Update last closest index
+    closest_idx = search_indices[local_closest_idx] % num_points
     _controller_state['last_closest_idx'] = closest_idx
-    
     closest_point = racetrack.centerline[closest_idx]
     
-    # Calculate cross-track error (lateral distance from path)
-    if closest_idx < len(racetrack.centerline) - 1:
-        # Vector along the path
-        path_vec = racetrack.centerline[closest_idx + 1] - racetrack.centerline[closest_idx]
-        path_length = np.linalg.norm(path_vec)
-        if path_length > 1e-6:
-            path_vec = path_vec / path_length
-        else:
-            path_vec = np.array([1.0, 0.0])
-        
-        # Vector from closest point to car
-        to_car = car_pos - closest_point
-        
-        # Cross-track error: perpendicular distance from path
-        # Use cross product to determine sign (left/right of path)
-        # 2D cross product: x1*y2 - y1*x2
-        cross_track_error = path_vec[0] * to_car[1] - path_vec[1] * to_car[0]
-    else:
-        # At end of path, use simple distance
-        cross_track_error = np.linalg.norm(car_pos - closest_point)
-        path_vec = np.array([np.cos(car_heading), np.sin(car_heading)])
+    # Cross-track error
+    next_idx = (closest_idx + 1) % num_points
+    path_vec = racetrack.centerline[next_idx] - racetrack.centerline[closest_idx]
+    path_length = np.linalg.norm(path_vec)
+    path_vec = path_vec / path_length if path_length > 1e-6 else np.array([1.0, 0.0])
+    to_car = car_pos - closest_point
+    cross_track_error = path_vec[0] * to_car[1] - path_vec[1] * to_car[0]
     
-    # Calculate path heading at closest point
-    if closest_idx < len(racetrack.centerline) - 1:
-        path_heading = np.arctan2(
-            racetrack.centerline[closest_idx + 1][1] - racetrack.centerline[closest_idx][1],
-            racetrack.centerline[closest_idx + 1][0] - racetrack.centerline[closest_idx][0]
-        )
-    else:
-        # Use previous segment or car heading
-        if closest_idx > 0:
-            path_heading = np.arctan2(
-                racetrack.centerline[closest_idx][1] - racetrack.centerline[closest_idx - 1][1],
-                racetrack.centerline[closest_idx][0] - racetrack.centerline[closest_idx - 1][0]
-            )
-        else:
-            path_heading = car_heading
+    # Path heading
+    path_heading = np.arctan2(
+        racetrack.centerline[next_idx][1] - racetrack.centerline[closest_idx][1],
+        racetrack.centerline[next_idx][0] - racetrack.centerline[closest_idx][0]
+    )
+    heading_error = np.arctan2(np.sin(path_heading - car_heading), np.cos(path_heading - car_heading))
     
-    # Heading error (difference between car heading and path heading)
-    heading_error = path_heading - car_heading
-    heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))  # Normalize to [-pi, pi]
-    
-    # Pure Pursuit: Find lookahead point
-    # Adaptive lookahead distance based on velocity
+    # Pure Pursuit
     lookahead_distance = max(8.0, min(25.0, 0.3 * current_vel + 5.0))
-    
-    # Find lookahead point along centerline
-    lookahead_idx = closest_idx
     accumulated_dist = 0.0
-    
-    for i in range(closest_idx, len(racetrack.centerline)):
-        if i < len(racetrack.centerline) - 1:
-            segment_dist = np.linalg.norm(racetrack.centerline[i+1] - racetrack.centerline[i])
-            if accumulated_dist + segment_dist >= lookahead_distance:
-                # Interpolate to get exact lookahead point
-                remaining = lookahead_distance - accumulated_dist
-                if segment_dist > 1e-6:
-                    t = remaining / segment_dist
-                    lookahead_point = racetrack.centerline[i] + t * (racetrack.centerline[i+1] - racetrack.centerline[i])
-                else:
-                    lookahead_point = racetrack.centerline[i]
-                break
-            accumulated_dist += segment_dist
-            lookahead_idx = i + 1
-        else:
-            # Reached end, use last point
-            lookahead_point = racetrack.centerline[-1]
+    for i in range(num_points):
+        idx1 = (closest_idx + i) % num_points
+        idx2 = (closest_idx + i + 1) % num_points
+        segment_dist = np.linalg.norm(racetrack.centerline[idx2] - racetrack.centerline[idx1])
+        if accumulated_dist + segment_dist >= lookahead_distance:
+            remaining = lookahead_distance - accumulated_dist
+            lookahead_point = racetrack.centerline[idx1] + (remaining / segment_dist) * (racetrack.centerline[idx2] - racetrack.centerline[idx1])
             break
+        accumulated_dist += segment_dist
+    else:
+        lookahead_point = racetrack.centerline[closest_idx]
     
-    # Pure Pursuit steering calculation
-    # Vector from car to lookahead point
     to_lookahead = lookahead_point - car_pos
     lookahead_dist = np.linalg.norm(to_lookahead)
-    
     if lookahead_dist > 1e-6:
-        # Angle from car heading to lookahead point
         alpha = np.arctan2(to_lookahead[1], to_lookahead[0]) - car_heading
-        alpha = np.arctan2(np.sin(alpha), np.cos(alpha))  # Normalize
-        
-        # Pure Pursuit formula: delta = atan(2*L*sin(alpha) / ld)
-        # where L = wheelbase, ld = lookahead distance, alpha = angle to lookahead
-        # This gives the steering angle needed to reach the lookahead point
-        if abs(lookahead_dist) > 1e-6:
-            pure_pursuit_steer = np.arctan2(2.0 * wheelbase * np.sin(alpha), lookahead_dist)
-        else:
-            pure_pursuit_steer = 0.0
+        alpha = np.arctan2(np.sin(alpha), np.cos(alpha))
+        pure_pursuit_steer = np.arctan2(2.0 * wheelbase * np.sin(alpha), lookahead_dist)
     else:
         pure_pursuit_steer = 0.0
     
-    # Stanley controller component: add cross-track error correction
-    # Stanley: delta = heading_error + atan(k * cross_track_error / v)
-    # where k is gain, v is velocity
+    # Stanley controller
     k_stanley = 2.5
-    if abs(current_vel) > 0.5:  # Avoid division by zero
-        stanley_correction = np.arctan(k_stanley * cross_track_error / current_vel)
-    else:
-        stanley_correction = k_stanley * cross_track_error / 0.5  # Linear approximation at low speed
-    
-    # Combine Pure Pursuit and Stanley
+    stanley_correction = np.arctan(k_stanley * cross_track_error / max(current_vel, 0.5))
     desired_steer = pure_pursuit_steer + 0.3 * stanley_correction
-    
-    # Clip steering angle to physical limits
     desired_steer = np.clip(desired_steer, parameters[1], parameters[4])
     
-    # Velocity control: adaptive based on curvature and cross-track error
-    base_velocity = 70.0  # m/s
+    # Velocity
+    base_velocity = 75.0
     
-    # Calculate path curvature (approximate)
-    curvature = 0.0
-    if closest_idx < len(racetrack.centerline) - 2:
-        p1 = racetrack.centerline[closest_idx]
-        p2 = racetrack.centerline[closest_idx + 1]
-        p3 = racetrack.centerline[closest_idx + 2]
-        
-        # Use three-point circle method to estimate curvature
-        v1 = p2 - p1
-        v2 = p3 - p2
-        v1_norm = np.linalg.norm(v1)
-        v2_norm = np.linalg.norm(v2)
-        
-        if v1_norm > 1e-6 and v2_norm > 1e-6:
-            # Angle between segments
-            cos_angle = np.dot(v1, v2) / (v1_norm * v2_norm)
+    # Curvature calculation (looped five points, S-curve handling)
+    lookahead_offsets = [-5,-3 ,0 ,5 ,10, 15, 20]  # offsets from closest_idx
+    points = [racetrack.centerline[(closest_idx + offset) % num_points] for offset in lookahead_offsets]
+    total_angle = 0.0
+    total_length = 0.0
+    for i in range(len(points) - 2):
+        v1 = points[i+1] - points[i]
+        v2 = points[i+2] - points[i+1]
+        l1 = np.linalg.norm(v1)
+        l2 = np.linalg.norm(v2)
+        if l1 > 1e-6 and l2 > 1e-6:
+            cos_angle = np.dot(v1, v2) / (l1 * l2)
             cos_angle = np.clip(cos_angle, -1.0, 1.0)
             angle = np.arccos(cos_angle)
-            
-            # Approximate curvature: larger angle change = higher curvature
-            curvature = angle / (v1_norm + v2_norm + 1e-6)
+            total_angle += angle
+            total_length += l1
+    curvature = total_angle / (total_length + 1e-6) if total_length > 1e-6 else 0.0
     
-    # Reduce speed based on curvature and cross-track error
-    curvature_factor = 1.0 / (1.0 + 40.0 * curvature)
+    # Adjust velocity
+    curvature_factor = 1.0 / (1.0 + 70.0 * curvature)
     cross_track_factor = 1.0 / (1.0 + 0.4 * abs(cross_track_error))
-    
     desired_velocity = base_velocity * curvature_factor * cross_track_factor
-    desired_velocity = np.clip(desired_velocity, 25.0, parameters[5])  # Min 25 m/s, max from parameters
+    desired_velocity = np.clip(desired_velocity, 15.0, parameters[5])
     
     return np.array([desired_steer, desired_velocity])
