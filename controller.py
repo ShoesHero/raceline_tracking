@@ -1,94 +1,65 @@
 import numpy as np
 from numpy.typing import ArrayLike
+from typing import Tuple, Optional
+
 from simulator import RaceTrack
 
-# ============================================================================
-# Path Utility Functions
-# ============================================================================
+# ---- Utilities -----------------------------------------------------------------
 
-def find_closest_point(state: ArrayLike, path: ArrayLike) -> tuple[int, float]:
-    """
-    Return the index of the path point closest to the vehicle and the distance.
-    state: [sx, sy, δ, v, ϕ]
-    path:  N×2 array of [x, y]
-    """
-    car_pos = state[:2]
-    distances = np.linalg.norm(path - car_pos, axis=1)
-    idx = int(np.argmin(distances))
-    return idx, float(distances[idx])
+def _as_array(a: ArrayLike) -> np.ndarray:
+    return np.asarray(a, dtype=float)
 
 
-def find_lookahead_point(
-    state: ArrayLike,
-    path: ArrayLike,
-    lookahead_distance: float
-) -> tuple[int, ArrayLike]:
-    """
-    Starting from the closest path point, move forward until the cumulative
-    arc length reaches the target lookahead_distance.
-    """
-    closest_idx, _ = find_closest_point(state, path)
+def find_closest_point(state: ArrayLike, path: ArrayLike) -> Tuple[int, float]:
+    s = _as_array(state)
+    p = _as_array(path)
+    car_pos = s[:2]
+    dists = np.linalg.norm(p - car_pos, axis=1)
+    idx = int(np.argmin(dists))
+    return idx, float(dists[idx])
+
+
+def find_lookahead_point(state: ArrayLike, path: ArrayLike, lookahead_distance: float) -> Tuple[int, np.ndarray]:
+    idx_closest, _ = find_closest_point(state, path)
+    p = _as_array(path)
     cumulative = 0.0
-    lookahead_idx = closest_idx
-
-    for i in range(1, len(path)):
-        prev_idx = (closest_idx + i - 1) % len(path)
-        next_idx = (closest_idx + i) % len(path)
-        seg_dist = np.linalg.norm(path[next_idx] - path[prev_idx])
-        cumulative += seg_dist
-
+    n = len(p)
+    for step in range(1, n):
+        i_prev = (idx_closest + step - 1) % n
+        i_next = (idx_closest + step) % n
+        cumulative += np.linalg.norm(p[i_next] - p[i_prev])
         if cumulative >= lookahead_distance:
-            lookahead_idx = next_idx
-            break
-
-    return lookahead_idx, path[lookahead_idx]
+            return i_next, p[i_next]
+    return idx_closest, p[idx_closest]
 
 
 def estimate_curvature(path: ArrayLike, idx: int, step: int = 5) -> float:
-    """
-    Estimate curvature at `idx` using the Menger curvature formula.
-    """
-    N = len(path)
-    i1 = (idx - step) % N
-    i2 = idx % N
-    i3 = (idx + step) % N
+    p = _as_array(path)
+    n = len(p)
+    i1 = (idx - step) % n
+    i2 = idx % n
+    i3 = (idx + step) % n
 
-    p1, p2, p3 = path[i1], path[i2], path[i3]
+    p1, p2, p3 = p[i1], p[i2], p[i3]
 
-    # Triangle area (absolute oriented area × 0.5)
-    area = 0.5 * abs(
-        (p2[0] - p1[0]) * (p3[1] - p1[1])
-        - (p3[0] - p1[0]) * (p2[1] - p1[1])
-    )
+    # area of triangle * 0.5
+    area = 0.5 * abs((p2[0] - p1[0]) * (p3[1] - p1[1]) - (p3[0] - p1[0]) * (p2[1] - p1[1]))
 
     a = np.linalg.norm(p2 - p1)
     b = np.linalg.norm(p3 - p2)
     c = np.linalg.norm(p1 - p3)
     denom = a * b * c
-
     if denom < 1e-9:
         return 0.0
-
     return float(4.0 * area / denom)
 
 
-# ============================================================================
-# Reference Generators (Velocity S1 and Steering S2)
-# ============================================================================
+# ---- Speed Reference (S1) helpers ---------------------------------------------
 
-def compute_safe_corner_speed(
-    curvature: float,
-    v_max: float,
-    raceline_mode: bool = False
-) -> float:
-    """
-    Compute a safe speed given curvature, with different lateral g-limits
-    for raceline vs. centerline mode.
-    """
+def compute_safe_corner_speed(curvature: float, v_max: float, raceline_mode: bool = False) -> float:
     if curvature < 1e-6:
         return v_max
 
-    # Grip profiles
     if raceline_mode:
         if curvature < 0.008:      a_lat = 21.0
         elif curvature < 0.020:    a_lat = 18.5
@@ -105,12 +76,26 @@ def compute_safe_corner_speed(
 
 
 def compute_braking_distance(v_current: float, v_target: float, a_brake: float) -> float:
-    """
-    Compute the braking distance needed to reduce from `v_current` to `v_target`.
-    """
     if v_current <= v_target:
         return 0.0
-    return max((v_current**2 - v_target**2) / (2 * a_brake), 0.0)
+    return max((v_current * v_current - v_target * v_target) / (2.0 * a_brake), 0.0)
+
+
+def _safety_multiplier(curv: float, raceline_mode: bool) -> float:
+    if raceline_mode:
+        if curv > 0.030: return 0.50
+        if curv > 0.020: return 0.68
+        if curv > 0.012: return 0.76
+        if curv > 0.006: return 0.90
+        if curv > 0.003: return 0.985
+        return 0.998
+    else:
+        if curv > 0.030: return 0.76
+        if curv > 0.020: return 0.82
+        if curv > 0.012: return 0.88
+        if curv > 0.006: return 0.94
+        if curv > 0.003: return 0.97
+        return 0.995
 
 
 def compute_reference_velocity(
@@ -119,28 +104,26 @@ def compute_reference_velocity(
     parameters: ArrayLike,
     raceline_mode: bool = False
 ) -> float:
-    """
-    S1: Physics-driven velocity planning.
-    Scan ahead for upcoming high-curvature segments, compute their safe speed,
-    then determine whether braking is required now.
-    """
-    v_min = float(parameters[2])
-    v_max = float(parameters[5])
-    a_max = float(parameters[10])
+    params = _as_array(parameters)
+    v_min = float(params[2])
+    v_max = float(params[5])
+    a_max = float(params[10])
 
     if v_min <= 20:
-        v_min = 20
+        v_min = 20.0
 
     v = abs(float(state[3]))
     closest_idx, _ = find_closest_point(state, path)
 
-    # Speed-based lookahead
     base_la = 40
     if v > 60:
-        extra = ((v - 60) ** 1.3) / 2
+        extra = ((v - 60.0) ** 1.3) / 2.0
         lookahead_pts = int(min(base_la + v / 2.5 + extra, 150))
     else:
         lookahead_pts = int(min(base_la + v / 2.5, 80))
+
+    path_arr = _as_array(path)
+    n = len(path_arr)
 
     min_safe = v_max
     dist_to_corner = 0.0
@@ -151,72 +134,47 @@ def compute_reference_velocity(
     cumulative = 0.0
 
     for i in range(lookahead_pts):
-        idx = (closest_idx + i) % len(path)
-
+        idx = (closest_idx + i) % n
         if i > 0:
-            prev = (closest_idx + i - 1) % len(path)
-            cumulative += np.linalg.norm(path[idx] - path[prev])
+            prev = (closest_idx + i - 1) % n
+            cumulative += np.linalg.norm(path_arr[idx] - path_arr[prev])
 
-        curv = estimate_curvature(path, idx, step=3)
+        curv = estimate_curvature(path_arr, idx, step=3)
         if curv <= 0.0008:
             continue
 
-        safe = compute_safe_corner_speed(curv, v_max, raceline_mode)
-
-        # Determine corner direction for S-curve accounting
+        safe_speed = compute_safe_corner_speed(curv, v_max, raceline_mode)
         turn_sign = 0.0
+
         if curv > 0.010:
-            p_prev = path[(idx - 1) % len(path)]
-            p_next = path[(idx + 1) % len(path)]
-            v1 = path[idx] - p_prev
-            v2 = p_next - path[idx]
+            p_prev = path_arr[(idx - 1) % n]
+            p_next = path_arr[(idx + 1) % n]
+            v1 = path_arr[idx] - p_prev
+            v2 = p_next - path_arr[idx]
             cross = v1[0] * v2[1] - v1[1] * v2[0]
             if abs(cross) > 1e-9:
                 turn_sign = np.sign(cross)
 
-        # Safety factors
-        if raceline_mode:
-            if curv > 0.030: safe *= 0.50
-            elif curv > 0.020: safe *= 0.68
-            elif curv > 0.012: safe *= 0.76
-            elif curv > 0.006: safe *= 0.90
-            elif curv > 0.003: safe *= 0.985
-            else:              safe *= 0.998
-        else:
-            if   curv > 0.030: safe *= 0.76
-            elif curv > 0.020: safe *= 0.82
-            elif curv > 0.012: safe *= 0.88
-            elif curv > 0.006: safe *= 0.94
-            elif curv > 0.003: safe *= 0.97
-            else:              safe *= 0.995
+        safe_speed *= _safety_multiplier(curv, raceline_mode)
 
-        # Mild S-curve penalty
-        if (
-            turn_sign != 0.0
-            and last_sign is not None
-            and last_sign_dist is not None
-            and (turn_sign * last_sign) < 0
-            and (cumulative - last_sign_dist) < 40.0
-        ):
-            safe *= 0.90
+        if turn_sign != 0.0 and last_sign is not None and last_sign_dist is not None and (turn_sign * last_sign) < 0 and (cumulative - last_sign_dist) < 40.0:
+            safe_speed *= 0.90
 
-        if turn_sign != 0:
+        if turn_sign != 0.0:
             last_sign = turn_sign
             last_sign_dist = cumulative
 
-        if safe < min_safe:
-            min_safe = safe
+        if safe_speed < min_safe:
+            min_safe = safe_speed
             dist_to_corner = cumulative
             found = True
 
-    # No slower corner found or already below limit
     if not found or min_safe >= v:
         return float(np.clip(v_max, v_min, v_max))
 
-    # Braking model
     brake_accel = 0.85 * a_max
     brake_dist = compute_braking_distance(v, min_safe, brake_accel)
-    brake_dist *= 1.40   # safety margin
+    brake_dist *= 1.40
 
     if dist_to_corner <= brake_dist:
         v_ref = min_safe
@@ -228,47 +186,52 @@ def compute_reference_velocity(
     return float(np.clip(v_ref, v_min, v_max))
 
 
+# ---- Steering Reference (S2) -------------------------------------------------
+
+def _transform_to_vehicle_frame(sx: float, sy: float, heading: float, px: float, py: float) -> Tuple[float, float]:
+    dx = px - sx
+    dy = py - sy
+    cos_h = np.cos(-heading)
+    sin_h = np.sin(-heading)
+    lx = dx * cos_h - dy * sin_h
+    ly = dx * sin_h + dy * cos_h
+    return lx, ly
+
+
 def compute_reference_steering(
     state: ArrayLike,
     centerline: ArrayLike,
     parameters: ArrayLike,
     raceline_mode: bool = False
 ) -> float:
-    """
-    S2: Pure pursuit steering with a small Stanley cross-track correction.
-    """
-    wheelbase = float(parameters[0])
-    delta_max = float(parameters[4])
+    params = _as_array(parameters)
+    wheelbase = float(params[0])
+    delta_max = float(params[4])
 
+    sx, sy = float(state[0]), float(state[1])
+    delta = float(state[2])
     v = abs(float(state[3]))
+    heading = float(state[4])
+
     speed = max(v, 1.0)
 
-    # Adaptive lookahead
     if speed < 50:
         Ld_target = 8.0 + 0.30 * speed
     else:
-        Ld_target = 23.0 + 0.45 * (speed - 50)
+        Ld_target = 23.0 + 0.45 * (speed - 50.0)
 
     if raceline_mode:
         Ld_target *= 0.9
 
     _, look_pt = find_lookahead_point(state, centerline, Ld_target)
-    sx, sy, _, _, heading = state
-
-    # Transform into vehicle coordinates
-    dx, dy = look_pt[0] - sx, look_pt[1] - sy
-    cos_h, sin_h = np.cos(-heading), np.sin(-heading)
-    lx = dx * cos_h - dy * sin_h
-    ly = dx * sin_h + dy * cos_h
+    lx, ly = _transform_to_vehicle_frame(sx, sy, heading, look_pt[0], look_pt[1])
 
     lx = max(lx, 0.5)
     Ld = max(np.hypot(lx, ly), 1.0)
     alpha = np.arctan2(ly, lx)
 
-    # Pure pursuit
-    pp = np.arctan2(2 * wheelbase * np.sin(alpha), Ld)
+    pure_pursuit = np.arctan2(2.0 * wheelbase * np.sin(alpha), Ld)
 
-    # Stanley correction
     closest_idx, _ = find_closest_point(state, centerline)
     next_idx = (closest_idx + 1) % len(centerline)
     seg = centerline[next_idx] - centerline[closest_idx]
@@ -282,37 +245,27 @@ def compute_reference_steering(
     stanley = np.arctan(k * cross_err / max(speed, 2.0))
 
     w = 0.22 if raceline_mode else 0.15
-    delta_ref = pp + w * stanley
+    delta_ref = pure_pursuit + w * stanley
 
     return float(np.clip(delta_ref, -0.9 * delta_max, 0.9 * delta_max))
 
 
-# ============================================================================
-# Low-Level Controllers (C1 Velocity, C2 Steering Rate)
-# ============================================================================
+# ---- Low-level controllers (C1, C2) -----------------------------------------
 
-def velocity_controller(
-    state: ArrayLike,
-    reference_velocity: float,
-    parameters: ArrayLike
-) -> float:
-    """
-    C1: Longitudinal PD controller on velocity.
-    """
+def velocity_controller(state: ArrayLike, reference_velocity: float, parameters: ArrayLike) -> float:
     v = float(state[3])
     v_ref = float(reference_velocity)
-    a_max = float(parameters[10])
+    a_max = float(_as_array(parameters)[10])
 
     error = v_ref - v
 
-    # Speed-dependent gain when braking
     if error < 0:
         if v < 50:
             kp = 6.5
         elif v > 90:
             kp = 6.5
         else:
-            kp = 5.0 + ((v - 50) / 40) * 1.3
+            kp = 5.0 + ((v - 50.0) / 40.0) * 1.3
     else:
         kp = 3.5
 
@@ -326,27 +279,24 @@ def steering_controller(
     parameters: ArrayLike,
     prev_error: float = 0.0,
     dt: float = 0.1
-) -> tuple[float, float]:
-    """
-    C2: PD steering rate controller.
-    """
+) -> Tuple[float, float]:
     delta = float(state[2])
     delta_ref = float(reference_steering)
     v = abs(float(state[3]))
 
-    v_min = float(parameters[7])
-    v_max = float(parameters[9])
+    params = _as_array(parameters)
+    v_min = float(params[7])
+    v_max = float(params[9])
 
     error = delta_ref - delta
-    d_error = (error - prev_error) / dt
+    d_error = (error - float(prev_error)) / float(dt)
 
-    # Gains based on speed
     if v < 50:
         kp, kd = 3.5, 0.50
     elif v > 70:
         kp, kd = 2.1, 0.85
     else:
-        α = (v - 20) / 50
+        α = (v - 20.0) / 50.0
         kp = 2.4 - 0.3 * α
         kd = 0.35 + 0.5 * α
 
@@ -356,80 +306,68 @@ def steering_controller(
     return v_delta, error
 
 
-# ============================================================================
-# High-Level and Low-Level Interfaces
-# ============================================================================
+# ---- High-level interface ----------------------------------------------------
 
 def compute_safe_raceline(
     raceline: ArrayLike,
     racetrack: RaceTrack,
     safety_margin: float = 0.7
-) -> ArrayLike:
-    """
-    (Unused, optional)
-    Modify raceline to enforce a margin from track boundaries.
-    """
-    safe = raceline.copy()
-
-    for i, p in enumerate(raceline):
+) -> np.ndarray:
+    rl = _as_array(raceline).copy()
+    for i, p in enumerate(rl):
         d_center = np.linalg.norm(racetrack.centerline - p, axis=1)
-        idx = np.argmin(d_center)
-
+        idx = int(np.argmin(d_center))
         right_pt = racetrack.right_boundary[idx]
-        left_pt  = racetrack.left_boundary[idx]
-        center   = racetrack.centerline[idx]
+        left_pt = racetrack.left_boundary[idx]
+        center = racetrack.centerline[idx]
 
         d_r = np.linalg.norm(p - right_pt)
         d_l = np.linalg.norm(p - left_pt)
 
         if d_r < safety_margin or d_l < safety_margin:
             direction = center - p
-            direction /= np.linalg.norm(direction) + 1e-6
+            norm = np.linalg.norm(direction) + 1e-6
+            direction /= norm
             shift = safety_margin - min(d_r, d_l)
-            safe[i] = p + direction * shift
-
-    return safe
+            rl[i] = p + direction * shift
+    return rl
 
 
 def controller(
     state: ArrayLike,
     parameters: ArrayLike,
     racetrack: RaceTrack,
-    raceline: ArrayLike | None = None
-) -> ArrayLike:
-    """
-    High-level controller that selects velocity + steering references.
-    """
+    raceline: Optional[ArrayLike] = None
+) -> np.ndarray:
     use_raceline = raceline is not None
     path = raceline if use_raceline else racetrack.centerline
 
     v_ref = compute_reference_velocity(state, path, parameters, raceline_mode=use_raceline)
-    δ_ref = compute_reference_steering(state, path, parameters, raceline_mode=use_raceline)
+    delta_ref = compute_reference_steering(state, path, parameters, raceline_mode=use_raceline)
 
-    return np.array([δ_ref, v_ref])
+    return np.array([float(delta_ref), float(v_ref)], dtype=float)
 
+
+# ---- Lower-level interface that converts references into actuator commands ----
 
 _prev_steering_error = 0.0
 
-def lower_controller(
-    state: ArrayLike,
-    desired: ArrayLike,
-    parameters: ArrayLike
-) -> ArrayLike:
-    """
-    Low-level controller converting desired [δ_ref, v_ref]
-    into actual commands [steering_rate, acceleration].
-    """
+
+def reset_steering_history() -> None:
     global _prev_steering_error
+    _prev_steering_error = 0.0
+
+
+def lower_controller(state: ArrayLike, desired: ArrayLike, parameters: ArrayLike) -> np.ndarray:
+    global _prev_steering_error
+    desired = _as_array(desired)
     assert desired.shape == (2,)
 
-    δ_ref, v_ref = map(float, desired)
+    delta_ref, v_ref = float(desired[0]), float(desired[1])
 
-    v_delta, err = steering_controller(
-        state, δ_ref, parameters, _prev_steering_error
-    )
+    v_delta, err = steering_controller(state, delta_ref, parameters, prev_error=_prev_steering_error)
     _prev_steering_error = err
 
-    a = velocity_controller(state, v_ref, parameters)
+    a_cmd = velocity_controller(state, v_ref, parameters)
 
-    return np.array([v_delta, a])
+    return np.array([float(v_delta), float(a_cmd)], dtype=float)
